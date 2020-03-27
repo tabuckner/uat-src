@@ -1,0 +1,122 @@
+node {
+	try {
+		// Environment Variables
+		env.appname  = "GambitCard"
+
+		//MOVED TO JENKINS NODE SETTINGS
+		//env.DATICAL_CLIENT_SECRET="123abc"
+		//env.DATICAL_SERVER="hostname"
+		//env.curlHome = "C:\\apps\\Git\\mingw64\\bin"
+		//env.datHome  = "C:\\apps\\DaticalDB\\repl"
+		//env.mvnHome  = "C:\\apps\\apache-maven-3.3.9\\bin"
+		//env.ucdHome  = "C:\\apps\\ibm-ucd-agent\\opt\\udclient"
+		//env.ZipHome  = "C:\\apps\\7-Zip"
+		
+		// Print Environment Variables
+		//echo sh(returnStdout: true, script: 'env')
+						
+		// String Definitions
+		//def appname  = "${env.appname}"
+		
+		// Handle label input for Jenkins CD
+		// Need to do this for XLD/UCD too
+		env.labels = "${env.labels}".trim()
+		if (env.labels == 'default' && env.CDTool == 'Jenkins') {
+			env.labels = "${env.pipeline}"
+		}
+		
+		// Handle deployver input
+		env.deployver = "${env.deployver}".trim()
+		if (env.deployver == 'LATEST' && env.CDTool == 'XLD') {
+			env.deployver = sh(returnStdout: true, script: 'C:/apps/Xebia/xl-deploy-7.1.0-cli/bin/cli.cmd -q -f C:/apps/Xebia/xl-deploy-7.1.0-cli/bin/fetchlatest-${appname}.py').trim()
+		}
+		
+		if (env.deployver == 'LATEST' && env.CDTool == 'UCD') {
+			env.deployver = "latestVersion"
+		}
+
+		def deployver = "${env.deployver}"
+		
+		deleteDir()
+
+		stage('Deploy') {
+			if (env.CDTool == 'XLD') {
+				DeployApp: {
+					xldDeploy serverCredentials: 'Admin', environmentId: 'Environments/${deployenv} ENV', packageId: 'Applications/${appname}/${deployver}'
+				}
+			}
+			
+			if (env.CDTool == 'UCD') {
+				DeployApp: {
+					// Substitute Properties in JSON deploy file
+					bat 'jq.exe ".application = \\"%appname%\\" | .environment = \\"%deployenv%\\" | .applicationProcess = \\"%appname% Deploy\\" | .versions[0].version = \\"%deployver%\\" | .versions[0].component = \\"%appname%-DB\\" | .versions[1].version = \\"%deployver%\\" | .versions[1].component = \\"%appname%-WAR\\"" ..\\workspace@script\\ucdDeploy.json > ucdDeploy%deployenv%.json'
+					
+					// Deploy via UCD
+					bat 'udclient.cmd -username admin -password password -weburl https://win-20e107kb4tn:8444 requestApplicationProcess ucdDeploy%deployenv%.json'
+				}
+			}
+			
+			if (env.CDTool == 'Jenkins') {
+				// Artifactory Configuration
+				def server = Artifactory.server 'art-001'
+
+				def buildInfo = Artifactory.newBuildInfo()
+				
+				def downloadSpec = """ {
+					"files": [
+						{
+							"pattern":"${env.appname}/*.war",
+							"build":"${env.appname}/${env.deployver}"
+						},
+						{
+							"pattern": "${env.appname}/*zip",
+							"build": "${env.appname}/${env.deployver}"
+						}
+					]
+				}"""
+
+				server.download spec: downloadSpec, buildInfo: buildInfo
+				
+				bat 'net stop \"Apache Tomcat 8.5 Tomcat8\"'
+				bat 'rmdir /Q /S \\apps\\apache-tomcat-8.5.14\\webapps\\%appname%-%deployenv%'
+				bat 'copy %appname%-%deployver%.war \\apps\\apache-tomcat-8.5.14\\webapps\\%appname%-%deployenv%.war'
+				bat 'net start \"Apache Tomcat 8.5 Tomcat8\"'
+				
+				
+				bat '7za.exe x *zip'		
+				
+				withCredentials([usernamePassword(credentialsId: 'DATICAL5', usernameVariable: 'DATICAL_USERNAME', passwordVariable: 'DATICAL_PASSWORD')]) {
+					//bat 'hammer.bat forecast --pipeline %pipeline% %deployenv%'
+					bat 'hammer.bat forecast --labels=%labels% --pipeline=%pipeline% --projectKey=%appname% %deployenv%'
+					//bat 'hammer.bat deploy --labels %pipeline% --pipeline %pipeline% %deployenv%'
+					bat 'hammer.bat deploy --labels=%labels% --pipeline=%pipeline% --projectKey=%appname% %deployenv%'
+				}
+				
+				//Refresh dbDef to AuditDB / DMC
+				//bat 'hammer.bat status --pipeline %pipeline% %deployenv%'
+				//bat 'curl.exe --insecure --request POST https://dmc-host/service/reporting/qa/v1/audit-db/sync & exit 0'
+			}
+		}
+	   
+	} catch (e) {
+		// If there was an exception thrown, the build failed
+		currentBuild.result = "FAILED"
+		throw e
+	} finally {
+		// Success or failure, always send notifications
+		notifyBuild(currentBuild.result)
+		archiveArtifacts allowEmptyArchive: true, artifacts: '**/Reports/**'
+	}
+}
+
+def notifyBuild(String buildStatus = 'STARTED') {
+	// build status of null means successful
+	buildStatus =  buildStatus ?: 'SUCCESSFUL'
+	
+	def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+	//def summary = "${subject} (${env.BUILD_URL})"
+	def summary = "${subject} (http://win-20e107kb4tn:8080/blue/organizations/jenkins/${env.JOB_NAME}/detail/${env.JOB_NAME}/${env.BUILD_NUMBER}/pipeline)"
+	
+	// Send notifications
+	mail bcc: '', body: summary, cc: '', from: 'jenkins@company.local', replyTo: '', subject: subject, to: 'dev@company.local'
+}
