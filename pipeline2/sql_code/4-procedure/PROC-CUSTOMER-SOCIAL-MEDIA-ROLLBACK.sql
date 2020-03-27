@@ -1,1 +1,0 @@
-drop procedure SP_Customer_Social_Accts;
